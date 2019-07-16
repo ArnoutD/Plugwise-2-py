@@ -1,6 +1,6 @@
 #!/bin/env python
 
-# Copyright (C) 2012,2013,2014,2015 Seven Watt <info@sevenwatt.com>
+# Copyright (C) 2012,2013,2014,2015,2016,2017 Seven Watt <info@sevenwatt.com>
 # <http://www.sevenwatt.com>
 #
 # This file is part of Plugwise-2-py.
@@ -28,7 +28,6 @@
 #   - return more reasonable responses than response message objects from the functions that don't do so yet
 #   - make message construction syntax better. Fields should only be specified once and contain name so we can serialize response message to dict
 #   - unit tests
-#   - pairing
 #   - support for older firmware versions
 
 import re
@@ -53,6 +52,8 @@ class Stick(SerialComChannel):
     """provides interface to the Plugwise Stick"""
 
     def __init__(self, port=0, timeout=DEFAULT_TIMEOUT):
+        self.circles = {} #dictionary {mac, circle} filled by circle init
+        self.last_counter = 0
         self.unjoined = set()
         SerialComChannel.__init__(self, port=port, timeout=timeout)
         if self.connected:
@@ -88,10 +89,20 @@ class Stick(SerialComChannel):
             print e
             info("SerialException during write - recovering. msg %s" % str(e))
             self.reconnect()
-        resp = self.expect_response(PlugwiseAckResponse)
-        success = False
-        if resp.status.value == 0xC1:
-            success = True
+        while 1:
+            resp = self.expect_response(PlugwiseAckResponse)
+            #test on sequence number, to be refined for wrap around
+            if (self.last_counter - int(resp.command_counter, 16) >= 0):
+                debug("Seqnr already used in send_msg")
+            #in case a timeout on previous send occurs, then ignore here.
+            if resp.status.value == 0xE1:
+                debug("Ignoring 0xE1 status in send_msg")
+                continue
+            success = False
+            if resp.status.value == 0xC1:
+                success = True
+            self.last_counter = int(resp.command_counter, 16)
+            break
         return (success, resp.command_counter)
 
     def _recv_response(self, retry_timeout=5):
@@ -182,8 +193,16 @@ class Stick(SerialComChannel):
                 error("protocol error [1]:"+str(reason))
             except OutOfSequenceException as reason:
                 #retry to receive the response
-                logcomm("RERR %4d %s - <!> out of sequence: %s" % ( len(msg), repr(msg), str(reason)))
-                error("protocol error [2]:"+str(reason))
+                #test ping response any offline circle
+                if resp.function_code == '000E':
+                    info("expect_response: out of sequence ping response")
+                    pingresp = PlugwisePingResponse()
+                    pingresp.unserialize(msg)
+                    circle = self.circles[resp.mac]
+                    circle.pong = True
+                else:
+                    logcomm("RERR %4d %s - <!> out of sequence: %s" % ( len(msg), repr(msg), str(reason)))
+                    error("protocol error [2]:"+str(reason))
             except UnexpectedResponse as reason:
                 #response could be an error status message
                 #suppress error logging when expecting a response to ping in case circle is offline
@@ -215,8 +234,16 @@ class Stick(SerialComChannel):
                         error("protocol error [3]:"+str(reason))
                     except OutOfSequenceException as reason:
                         #retry to receive the response
-                        logcomm("RERR %4d %s - <!> out of sequence while interpreting as Ack: %s" % ( len(msg), repr(msg), str(reason)))
-                        error("protocol error [4]:"+str(reason))
+                        #test ping response any offline circle
+                        if resp.function_code == '000E':
+                            info("expect_response while interpreting as Ack: out of sequence ping response")
+                            pingresp = PlugwisePingResponse()
+                            pingresp.unserialize(msg)
+                            circle = self.circles[resp.mac]
+                            circle.pong = True
+                        else:
+                            logcomm("RERR %4d %s - <!> out of sequence while interpreting as Ack: %s" % ( len(msg), repr(msg), str(reason)))
+                            error("protocol error [4]:"+str(reason))
                     except UnexpectedResponse as reason:
                         #response could be an error status message
                         logcomm("RERR %4d %s - <!> unexpected response error while interpreting as Ack: %s" % ( len(msg), repr(msg), str(reason)))
@@ -321,6 +348,7 @@ class Circle(object):
         #debug("mac %s" % (type(mac),))
 
         self._comchan = comchan
+        comchan.circles[self.mac] = self
         
         self.attr = attr
         
@@ -336,6 +364,8 @@ class Circle(object):
         
         self.joined = False
         self.online = False
+        self.online_changed = False
+        self.pong = False
         self.initialized = False
         self.relay_state = '?'
         self.switch_state = '?'
@@ -359,26 +389,38 @@ class Circle(object):
         
         self.reinit()
         
+    def set_online(self):
+        self.online = True
+        self.online_changed = True
+        self.pong = False
+
     def reinit(self):
         #self.get_info()  called by _get_interval
         try:
             self._get_interval()
             self.online = True
+            self.online_changed = True
             self.initialized = True
         except (ValueError, TimeoutException, SerialException, AttributeError) as reason:
             self.online = False
+            self.online_changed = True
             self.initialized = False
             error("OFFLINE Circle '%s' during initialization Error: %s" % (self.attr['name'], str(reason)))       
+        self.pong = False
 
     def get_status(self):
         retd = {}
         retd["mac"] = self.mac
-        retd["type"] = self.type()
+        if self._devtype is None:
+            retd["type"] = "unknown"
+        else:
+            retd["type"] = self._devtype
         retd["name"] = self.attr["name"]
         retd["location"] = self.attr["location"]
         retd["online"] = self.online
         retd["lastseen"] = self.last_seen
         retd["readonly"] = (self.attr['always_on'] != 'False')
+        retd["reverse_pol"] = (self.attr['reverse_pol'] != 'False')
         retd["switch"] = self.relay_state
         retd["switchreq"] = self.switch_state
         retd["schedule"] = self.schedule_state
@@ -443,13 +485,28 @@ class Circle(object):
                 if self.online:
                     info("OFFLINE Circle '%s'." % (self.attr['name'],))
                 self.online = False
+                self.online_changed = True
+                self.pong = False
                 raise TimeoutException("Timeout while waiting for response from circle '%s'" % (self.attr['name'],))
             
+            # if not isinstance(resp, response_class):
+                # #error status returned
+                # if resp.status.value == 0xE1:
+                    # debug("Received an error status '%04X' from circle '%s' - Network slow or circle offline - Retry receive ..." % (resp.status.value, self.attr['name']))
+                    # retry_timeout = 1 #allow 1+1 seconds for timeout after an E1.
+                # else:
+                    # error("Received an error status '%04X' from circle '%s' with correct seqnr - Retry receive ..." % (resp.status.value, self.attr['name']))
             if not isinstance(resp, response_class):
                 #error status returned
                 if resp.status.value == 0xE1:
                     debug("Received an error status '%04X' from circle '%s' - Network slow or circle offline - Retry receive ..." % (resp.status.value, self.attr['name']))
-                    retry_timeout = 1 #allow 1+1 seconds for timeout after an E1.
+                    #retry_timeout = 1 #allow 1+1 seconds for timeout after an E1.
+                    if self.online:
+                        info("OFFLINE Circle '%s'." % (self.attr['name'],))
+                    self.online = False
+                    self.online_changed = True
+                    self.pong = False
+                    raise TimeoutException("Timeout while waiting for response from circle '%s'" % (self.attr['name'],))
                 else:
                     error("Received an error status '%04X' from circle '%s' with correct seqnr - Retry receive ..." % (resp.status.value, self.attr['name']))
             else:
@@ -457,6 +514,8 @@ class Circle(object):
                 if not self.online:
                     info("ONLINE  Circle '%s' after %d seconds." % (self.attr['name'], ts_now - self.last_seen))
                     self.online = True
+                    self.online_changed = True
+                    self.pong = False
                 #self.last_seen = (datetime.datetime.utcnow()-datetime.timedelta(seconds=time.timezone)).isoformat()
                 self.last_seen = ts_now
                 return resp
@@ -464,6 +523,8 @@ class Circle(object):
         if self.online:
             info("OFFLINE Circle '%s'." % (self.attr['name'],))
         self.online = False
+        self.online_changed = True
+        self.pong = False
         #TODO: Replace timeout exception by more specific exception
         raise TimeoutException("Received multiple error messages from circle '%s'" % (self.attr['name'],))
         
@@ -545,6 +606,7 @@ class Circle(object):
         """
         msg = PlugwisePowerUsageRequest(self.mac).serialize()
         _, seqnr  = self._comchan.send_msg(msg)
+        debug("counters mac %s, seqnr %s" % (self.mac, seqnr))
         resp = self._expect_response(PlugwisePowerUsageResponse, seqnr)
         p1s, p8s, p1h, pp1h = resp.pulse_1s.value, resp.pulse_8s.value, resp.pulse_hour.value, resp.pulse_prod_hour.value
         if self.attr['production'] == 'False':
@@ -564,9 +626,16 @@ class Circle(object):
         debug("POWER:          1h: %.3f" % (kw_1h,))
         kw_p_1h = 1000*self.pulses_to_kWs(self.pulse_correction(pulse_prod_1h, 3600))/3600.0
         debug("POWER:     prod 1h: %.3f" % (kw_p_1h,))
+        if 'reverse_pol' in self.attr and self.attr['reverse_pol'] == 'True':
+            kw_1s = -kw_1s 
+            kw_8s = -kw_8s
+            kw_1h = -kw_1h
+            kw_p_1h = -kw_p_1h
+            debug("get_power_usage: reverse polarity of %s" % (self.mac,))
         self.power = [kw_1s, kw_8s, kw_1h, kw_p_1h]
         self.power_ts = calendar.timegm(datetime.datetime.utcnow().utctimetuple())
         #just return negative values. It is production
+
         return (kw_1s, kw_8s, kw_1h, kw_p_1h)
 
     def get_info(self):
@@ -633,13 +702,13 @@ class Circle(object):
                 error("Wrong switch status reply when  switching on. expected '00D8', received '%04X'" % (resp.status.value,))
             self.switch_state = 'on'
             self.relay_state = 'on'
-            self.schedule_state = 'off'
+            #self.schedule_state = 'off'
         else:
             if resp.status.value != 0xDE:
                 error("Wrong switch status reply when switching off. expected '00DE', received '%04X'" % (resp.status.value,))
             self.switch_state = 'off'
             self.relay_state = 'off'
-            self.schedule_state = 'off'
+            #self.schedule_state = 'off'
         return 
 
     def switch_on(self):
@@ -689,14 +758,14 @@ class Circle(object):
             error("get_power_usage_history: empty first entry in power buffer")
             return []
         prev2_dt = prev_dt
-        both = False
+        #both = False
         for i in range(0, 4):
             dt = getattr(resp, "logdate%d" % (i+1,)).value
             if not dt is None:
                 dts.append(dt)
                 pulses.append(getattr(resp, "pulses%d" % (i+1,)).value)
                 if prev_dt == dts[i]:
-                    both = True
+                    #both = True
                     intervals.append((dts[i]-prev2_dt).total_seconds())
                 else:
                     intervals.append((dts[i]-prev_dt).total_seconds())               
@@ -711,17 +780,28 @@ class Circle(object):
             if intervals[i] == 0:
                 if len(dts)>i+1 and dts[i] == dts[i+1]:
                     if len(dts)>i+2:
-                        intervals[i] = (dts[i+2]-dts[i]).total_seconds()
+                        intervals[i] = (dts[i+2]-dts[i]).total_seconds()                        
                     else:
                         intervals[i]=3600
                 elif len(dts)>i+1:  
                     intervals[i] = (dts[i+1]-dts[i]).total_seconds()
                 else:
                     intervals[i]=3600
+                if intervals[i] == 0:
+                    #can occur when time syncing the circle sets time some seconds back.
+                    error("get_power_usage_history: all four intervals having same timestamp. set interval=60")
+                    error("get_power_usage_history: dts %s" % dts)
+                    error("get_power_usage_history: pulses %s" % pulses)
+                    intervals[i] = 60
                
             corrected_pulses = self.pulse_correction(pulses[i], intervals[i])
             watt = self.pulses_to_kWs(corrected_pulses)/intervals[i]*1000
             watthour = self.pulses_to_kWs(corrected_pulses)/3600*1000
+            if 'reverse_pol' in self.attr and self.attr['reverse_pol'] == 'True':
+                watt = -watt 
+                watthour = -watthour
+                debug("get_power_usage_history: reverse polarity of %s" % (self.mac,))
+
             retl.append((dts[i], watt, watthour))
         return retl
 
@@ -799,6 +879,8 @@ class Circle(object):
             info("circle.load_schedule. enter function")
             self.schedule._dst_shift(dst)
             #TODO: add test on inequality of CRC
+            
+            #info("schedule %s" % self.schedule._pulse)
             for idx in range(0,84):
                 chunk = self.schedule._pulse[(8*idx):(8*idx+8)]
                 req = PlugwisePrepareScheduleRequest(idx, chunk)
@@ -880,6 +962,14 @@ class Circle(object):
         """
         req = PlugwisePingRequest(self.mac)
         _, seqnr  = self._comchan.send_msg(req.serialize())
+        debug("pinged mac %s, seqnr %s" % (self.mac, seqnr))
+        return #self._expect_response(PlugwisePingResponse, seqnr)
+
+    def ping_synchronous(self):
+        """ping circle
+        """
+        req = PlugwisePingRequest(self.mac)
+        _, seqnr  = self._comchan.send_msg(req.serialize())
         return self._expect_response(PlugwisePingResponse, seqnr)
 
     def read_node_table(self):
@@ -923,17 +1013,23 @@ class Schedule(object):
     calibration data is required for conversion to pulses and CRC calculation
     """
     
-    def __init__(self, name, scheddata, convertor):
+    def __init__(self, name, scheddata, circle_w2p):
         """
         ......
         """
         self.name = str(name)
         self.dst = 0
         self._watt = scheddata
-        self._pulse = list(int(convertor(i)) if i>=0 else i for i in self._watt)
-        self._shift_day()
-        self._hex = ''.join(("%04X" % int_to_uint(i,4)) for i in self._pulse)
+        self._pulse = list(int(self.watt_to_pulses(circle_w2p, w)) if w>0 else w for w in self._watt)
+        #self._pulse = list(int(circle_w2p(i)) if i>0 else i for i in self._watt)
+        #self._shift_day()
         self.CRC = crc_fun(''.join(str(struct.pack('>h',i)) for i in self._pulse))
+        #self._hex = ''.join(("%04X" % int_to_uint(i,4)) for i in self._pulse)
+        
+    def watt_to_pulses(self, circle_w2p, watt):
+        #minimize at one pulse when watts is around 3 or lower.
+        pulses = circle_w2p(watt)
+        return pulses if pulses > 0 else 1
 
     def dump_status(self):
         retd = {}
@@ -942,11 +1038,11 @@ class Schedule(object):
         retd['schedule'] = self._watt
         return retd
         
-    def _shift_day(self):
-        info("circle.schedule._shift_day rotate left by one day")
-        #rotate schedule a day to the left
-        self._pulse = self._pulse[96:]+self._pulse[:96]
-        #self.CRC = crc_fun(''.join(str(struct.pack('>h',i)) for i in self._pulse))
+    # def _shift_day(self):
+        # info("circle.schedule._shift_day rotate left by one day")
+        # #rotate schedule a day to the left
+        # self._pulse = self._pulse[96:]+self._pulse[:96]
+        # #self.CRC = crc_fun(''.join(str(struct.pack('>h',i)) for i in self._pulse))
 
     def _dst_shift(self, dst):
         if self.dst and not dst:

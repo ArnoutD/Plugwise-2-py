@@ -12,6 +12,8 @@ Plugwise-2-py
 - Robust matching of commands and replies in Zigbee communication.
 - Openhab interface through MQTT.
 - Domoticz interface through MQTT.
+- Homey interface through MQTT.
+- Home Assistant interface through MQTT.
 
 ##Introduction
 Plugwise-2-py evolved in a monitoring and control server for plugwise devices.
@@ -35,7 +37,6 @@ pw-control.json and schedules/*.json can be edited with the web application (see
 In the dynamic configuration:
 - logging of the in-circle integrated values can be enabled (usually the one-value-per-hour loggings.
 - logging of the actual power (production and or consumption) can  be logged. This value will be logged every 10 seconds.
-- switching schedules can be enabled and disabled.
 
 Finally the code implements several commands that have not been published before, at least not in 2012.
 
@@ -102,12 +103,15 @@ The default port is 1883.
 
 ```nohup python Plugwise-2.py >>/tmp/pwout.log&```
 
+##autostart:
+Plugwise-2-py and the web-server can be automatically started with upstart in Ubuntu, or a cron job on the Raspberry pi. See instructions in the `autostart-howto` folder.
+
 ##debug:
 the log level can be programmed in pw-control.json. Changes are picked up latest after 10 seconds.
 
 `"log_level": "info"` can have values error, info, debug
 
-`"log_comm": "no"` can have values no and yes. 
+`"log_comm": "no"` can have values no and yes.
 
 log_comm results in logging to  pw-communications.log, in the log folder specified through log_path in pw-hostconfig.json
 
@@ -232,4 +236,48 @@ Domoticz
 A MQTT to HTTP commands interface (using Node-Red) has been developed:
 https://www.domoticz.com/forum/viewtopic.php?f=14&t=7420&sid=22502c728a9a4f7d5ac93e6f5c0642a9
 
-I am investigating a more direct MQTT to Domoticz interface currently. 
+I am investigating a more direct MQTT to Domoticz interface currently.
+
+Homey
+--------
+A Homey app is available in the appstore: https://apps.athom.com/app/com.gruijter.plugwise2py
+
+For further instructions please visit https://forum.athom.com/discussion/1998
+
+Home Assistant
+--------
+Interfacing with Home Assistant can be done through MQTT.
+
+Some examples:
+```
+sensor:
+ - platform: mqtt
+   name: Coffee
+   state_topic: 'plugwise2py/state/power/000D6F000XXXXXXX'
+   unit_of_measurement: 'W'
+   value_template: '{{ value_json.power }}'
+   sensor_class: power
+```
+```
+switch:
+ - platform: mqtt
+   name: Coffee
+   optimistic : false
+   command_topic: 'plugwise2py/cmd/switch/000D6F000XXXXXXX'
+   state_topic: 'plugwise2py/state/circle/000D6F000XXXXXXX'
+   value_template: '{"mac": "000D6F000XXXXXXX", "cmd": "switch", "val": "{{ value_json.switch }}"}'
+   payload_on: '{"mac": "000D6F000XXXXXXX", "cmd": "switch", "val": "on"}'
+   payload_off: '{"mac": "000D6F000XXXXXXX", "cmd": "switch", "val": "off"}'
+   retain: true
+```
+```
+binary_sensor:
+ - platform: mqtt
+   name: 'Plugwise Cicle Status for Coffee'
+   state_topic: 'plugwise2py/state/circle/000D6F000XXXXXXX'
+   sensor_class: connectivity
+   value_template: '{{ value_json.online }}'
+   payload_on: True
+   payload_off: False
+```
+
